@@ -47,7 +47,7 @@ On the target server:
 - SSH server must be reachable on port `22`;
 - password login must work for the selected SSH user;
 - `ssh-keygen` must be available;
-- `ssh-keyscan` must be available for automatic `known_hosts` setup.
+- SFTP subsystem must be enabled in SSH for automatic `known_hosts` setup.
 
 ## Usage
 
@@ -63,6 +63,10 @@ The script asks for:
 - target SSH username;
 - target SSH password;
 - Borg server address, with `hostname -f` offered as the default.
+
+If the Borg user already exists, the script asks whether to continue. It can
+also generate and set a new password for the existing Borg user when needed,
+for example after a previous interrupted bootstrap run.
 
 Example values:
 

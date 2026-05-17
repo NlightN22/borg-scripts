@@ -14,8 +14,21 @@ import socket
 import string
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    from cryptography.utils import CryptographyDeprecationWarning
+except ImportError:
+    CryptographyDeprecationWarning = None
+
+if CryptographyDeprecationWarning is not None:
+    warnings.filterwarnings(
+        "ignore",
+        category=CryptographyDeprecationWarning,
+        module=r"paramiko\..*",
+    )
 
 try:
     import paramiko
@@ -185,6 +198,18 @@ def run_local(command: list[str], input_text: str | None = None) -> subprocess.C
     )
 
 
+def scan_ssh_host_keys(host: str) -> list[str]:
+    ssh_keyscan = shutil.which("ssh-keyscan")
+    if not ssh_keyscan:
+        fail("ssh-keyscan is required on the Borg server. Install it with: apt install -y openssh-client")
+
+    result = run_local([ssh_keyscan, "-T", str(SOCKET_TIMEOUT_SECONDS), host])
+    if result.returncode != 0 or not result.stdout.strip():
+        fail(f"Could not scan SSH host key for {host}: {result.stderr.strip()}")
+
+    return [line for line in result.stdout.splitlines() if line and not line.startswith("#")]
+
+
 def user_exists(username: str) -> bool:
     try:
         pwd.getpwnam(username)
@@ -198,6 +223,14 @@ def generate_password(length: int = 28) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def set_user_password(username: str) -> str:
+    password = generate_password()
+    result = run_local(["chpasswd"], input_text=f"{username}:{password}\n")
+    if result.returncode != 0:
+        fail(f"chpasswd failed: {result.stderr.strip() or result.stdout.strip()}")
+    return password
+
+
 def create_borg_user(username: str) -> BorgUserInfo:
     home = Path("/home") / username
     if user_exists(username):
@@ -206,18 +239,20 @@ def create_borg_user(username: str) -> BorgUserInfo:
             default=False,
         ):
             fail(f"Borg user '{username}' already exists. No changes were made.")
-        return BorgUserInfo(username=username, home=home, password=None, created=False)
+        password = None
+        if prompt_yes_no(
+            f"Generate and set a new password for existing Borg user '{username}'?",
+            default=False,
+        ):
+            password = set_user_password(username)
+        return BorgUserInfo(username=username, home=home, password=password, created=False)
 
     print(f"Creating Borg user {username}...")
     result = run_local(["useradd", "-m", "-s", "/bin/bash", username])
     if result.returncode != 0:
         fail(f"useradd failed: {result.stderr.strip() or result.stdout.strip()}")
 
-    password = generate_password()
-    result = run_local(["chpasswd"], input_text=f"{username}:{password}\n")
-    if result.returncode != 0:
-        fail(f"chpasswd failed: {result.stderr.strip() or result.stdout.strip()}")
-
+    password = set_user_password(username)
     return BorgUserInfo(username=username, home=home, password=password, created=True)
 
 
@@ -257,10 +292,6 @@ def append_authorized_key(authorized_keys: Path, public_key: str) -> bool:
 
 
 def ensure_local_known_host(host: str) -> None:
-    ssh_keyscan = shutil.which("ssh-keyscan")
-    if not ssh_keyscan:
-        print("WARNING: ssh-keyscan is not installed; skipping local known_hosts update.")
-        return
     ssh_keygen = shutil.which("ssh-keygen")
 
     known_hosts = Path("/root/.ssh/known_hosts")
@@ -274,13 +305,8 @@ def ensure_local_known_host(host: str) -> None:
         if check.returncode == 0 and check.stdout.strip():
             return
 
-    result = run_local([ssh_keyscan, "-T", str(SOCKET_TIMEOUT_SECONDS), "-H", host])
-    if result.returncode != 0 or not result.stdout.strip():
-        print(f"WARNING: could not scan SSH host key for {host}: {result.stderr.strip()}")
-        return
-
     existing = known_hosts.read_text(encoding="utf-8", errors="replace")
-    new_lines = [line for line in result.stdout.splitlines() if line and line not in existing]
+    new_lines = [line for line in scan_ssh_host_keys(host) if line not in existing]
     if not new_lines:
         return
     with known_hosts.open("a", encoding="utf-8") as file:
@@ -338,31 +364,34 @@ def ensure_target_key(client: "paramiko.SSHClient") -> TargetKeyInfo:
 
 def ensure_target_known_host(client: "paramiko.SSHClient", borg_host: str) -> None:
     print(f"Adding Borg server {borg_host} to target known_hosts...")
+    host_key_lines = scan_ssh_host_keys(borg_host)
     home = get_target_home(client)
     ssh_dir = f"{home}/.ssh"
     known_hosts = f"{ssh_dir}/known_hosts"
-    quoted_known_hosts = shlex.quote(known_hosts)
     command = " && ".join(
         [
             f"mkdir -p {shlex.quote(ssh_dir)}",
             f"chmod 700 {shlex.quote(ssh_dir)}",
-            f"touch {quoted_known_hosts}",
-            f"chmod 600 {quoted_known_hosts}",
-            (
-                f"ssh-keygen -F {shlex.quote(borg_host)} -f {quoted_known_hosts} >/dev/null "
-                f"|| ssh-keyscan -T {SOCKET_TIMEOUT_SECONDS} -H {shlex.quote(borg_host)} "
-                f">> {quoted_known_hosts}"
-            ),
+            f"touch {shlex.quote(known_hosts)}",
+            f"chmod 600 {shlex.quote(known_hosts)}",
         ]
     )
     try:
         run_remote(client, command)
-    except RuntimeError as exc:
-        fail(
-            "Could not add Borg server to target known_hosts. "
-            "Make sure ssh-keyscan is installed on the target server.\n"
-            f"{exc}"
-        )
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(known_hosts, "r") as remote_file:
+                existing = remote_file.read().decode("utf-8", errors="replace")
+            new_lines = [line for line in host_key_lines if line not in existing]
+            if new_lines:
+                with sftp.open(known_hosts, "a") as remote_file:
+                    if existing and not existing.endswith("\n"):
+                        remote_file.write("\n")
+                    remote_file.write("\n".join(new_lines) + "\n")
+        finally:
+            sftp.close()
+    except Exception as exc:
+        fail(f"Could not add Borg server to target known_hosts: {exc}")
 
 
 def verify_reverse_ssh(client: "paramiko.SSHClient", domain: str, borg_host: str) -> str:
